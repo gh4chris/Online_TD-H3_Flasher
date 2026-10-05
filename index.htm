@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>H3/H8 Firmware Flasher</title>
+    <style>
+        :root { color-scheme: light dark; }
+        body { margin: 0; font-family: sans-serif; background: Canvas; color: CanvasText; }
+        main { max-width: 42rem; margin: 0 auto; padding: 2rem 1rem; text-align: center; }
+        [hidden] { display: none !important; }
+        .tool-section { display: grid; justify-items: center; gap: .75rem; }
+        button, input { font: inherit; }
+        #status { min-height: 1.5em; margin: 2rem 0; font-weight: bold; }
+    </style>
+</head>
+<body>
+<main>
+    <h1 id="pageTitle">H3/H8 Firmware Flasher</h1>
+
+    <section id="flasherSection" class="tool-section">
+        <input type="file" id="firmwareFile" accept=".bin,application/octet-stream">
+        <button type="button" id="connectButton" disabled>Serial Port</button>
+        <button type="button" id="flashButton" disabled>Flash Firmware</button>
+        <button type="button" id="abortButton" disabled>Abort</button>
+    </section>
+
+    <section id="codeplugSection" class="tool-section" hidden>
+        <input type="file" id="codeplugFile" accept=".nfw,application/octet-stream">
+        <button type="button" id="defaultButton" hidden>Load Default Codeplug</button>
+        <button type="button" id="saveButton" disabled>Save Codeplug</button>
+        <button type="button" id="cpConnectButton">Serial Port</button>
+        <button type="button" id="readButton" disabled>Read Codeplug</button>
+        <button type="button" id="writeButton" disabled>Write Codeplug</button>
+        <button type="button" id="cpAbortButton" disabled>Abort</button>
+    </section>
+
+    <div id="status" role="status" aria-live="polite"></div>
+    <button type="button" id="modeButton">Codeplug Manager</button>
+</main>
+
+<script>
+"use strict";
+
+const statusDiv = document.getElementById("status");
+const nicTool = {};
+
+function errorMessage(error) {
+    return error instanceof Error ? error.message : String(error);
+}
+
+/* ==================== Firmware Flasher ==================== */
+(() => {
+    let port = null;
+    let writer = null;
+    let reader = null;
+    let started = false;
+    let firmware = null;
+    let lastBlock = -1;
+    let detected = false;
+    let flashing = false;
+    let block = 0;
+    let timeoutId = null;
+    let shuttingDown = false;
+
+    const firmwareFileInput = document.getElementById("firmwareFile");
+    const connectButton = document.getElementById("connectButton");
+    const abortButton = document.getElementById("abortButton");
+    const flashButton = document.getElementById("flashButton");
+
+    const initSequence = new Uint8Array([
+        0xA0, 0xEE, 0x74, 0x71, 0x07, 0x74,
+        0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+        0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+        0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55
+    ]);
+
+    function clearHandshakeTimer() {
+        if (timeoutId !== null) {
+            clearTimeout(timeoutId);
+            timeoutId = null;
+        }
+    }
+
+    async function closeSerial() {
+        clearHandshakeTimer();
+        const currentReader = reader;
+        const currentWriter = writer;
+        const currentPort = port;
+        reader = null;
+        writer = null;
+        port = null;
+
+        if (currentReader) {
+            try { await currentReader.cancel(); } catch (error) { console.warn("Reader cancel failed:", error); }
+            try { currentReader.releaseLock(); } catch (error) { console.warn("Reader release failed:", error); }
+        }
+        if (currentWriter) {
+            try { currentWriter.releaseLock(); } catch (error) { console.warn("Writer release failed:", error); }
+        }
+        if (currentPort) {
+            try { await currentPort.close(); } catch (error) { console.warn("Port close failed:", error); }
+        }
+    }
+
+    async function openSerial(baudRate) {
+        if (!port) return false;
+        try {
+            await port.open({ baudRate });
+            writer = port.writable.getWriter();
+            reader = port.readable.getReader();
+            return true;
+        } catch (error) {
+            statusDiv.textContent = `Serial port error: ${errorMessage(error)}`;
+            await closeSerial();
+            return false;
+        }
+    }
+
+    async function selectSerialPort() {
+        try { port = await navigator.serial.requestPort(); }
+        catch { port = null; }
+    }
+
+    function setActiveButtons() {
+        if (started) {
+            abortButton.disabled = false;
+            connectButton.disabled = true;
+            flashButton.disabled = true;
+            firmwareFileInput.disabled = true;
+        } else {
+            abortButton.disabled = true;
+            connectButton.disabled = firmware === null;
+            flashButton.disabled = firmware === null || port === null || writer === null || reader === null;
+            firmwareFileInput.disabled = false;
+        }
+    }
+
+    function stopTransfer() {
+        started = false;
+        detected = false;
+        flashing = false;
+        block = 0;
+        clearHandshakeTimer();
+    }
+
+    firmwareFileInput.addEventListener("change", async event => {
+        firmware = null;
+        lastBlock = -1;
+        try {
+            const file = event.target.files[0];
+            if (!file) {
+                statusDiv.textContent = "";
+                setActiveButtons();
+                return;
+            }
+            const fileBytes = new Uint8Array(await file.arrayBuffer());
+            if (fileBytes.length === 0) throw new Error("Firmware file is empty");
+            const roundedLength = Math.ceil(fileBytes.length / 32) * 32;
+            if (roundedLength > 0xF800) throw new Error("File too large");
+            lastBlock = roundedLength / 32 - 1;
+            firmware = new Uint8Array(roundedLength);
+            firmware.set(fileBytes);
+            statusDiv.textContent = "Firmware file loaded.";
+        } catch (error) {
+            firmwareFileInput.value = "";
+            statusDiv.textContent = `File error: ${errorMessage(error)}`;
+        }
+        setActiveButtons();
+    });
+
+    connectButton.addEventListener("click", async () => {
+        if (!("serial" in navigator)) {
+            statusDiv.textContent = "Web Serial not supported - please use desktop Chrome or Edge.";
+            return;
+        }
+        shuttingDown = true;
+        await closeSerial();
+        shuttingDown = false;
+        await selectSerialPort();
+        if (port && await openSerial(115200)) statusDiv.textContent = "Connected to serial port.";
+        else if (!port) statusDiv.textContent = "";
+        setActiveButtons();
+    });
+
+    flashButton.addEventListener("click", async () => {
+        if (!firmware || !reader || !writer) return;
+        started = true;
+        shuttingDown = false;
+        detected = false;
+        flashing = false;
+        block = 0;
+        setActiveButtons();
+        statusDiv.textContent = "Turn off radio, press PTT(H3) or Flashlight(H8), turn on radio with button still held.";
+        try {
+            await byteReader();
+        } catch (error) {
+            if (!shuttingDown) statusDiv.textContent = `Flashing failed: ${errorMessage(error)}`;
+            stopTransfer();
+        }
+        setActiveButtons();
+    });
+
+    abortButton.addEventListener("click", async () => {
+        shuttingDown = true;
+        stopTransfer();
+        await closeSerial();
+        statusDiv.textContent = "Flashing aborted.";
+        setActiveButtons();
+    });
+
+    function scheduleFirstBlock() {
+        clearHandshakeTimer();
+        timeoutId = setTimeout(() => {
+            timeoutId = null;
+            if (!started || shuttingDown || !writer) return;
+            flashing = true;
+            void byteProcessor(0xA3).catch(error => {
+                if (!shuttingDown) statusDiv.textContent = `Flashing failed: ${errorMessage(error)}`;
+                stopTransfer();
+                setActiveButtons();
+            });
+        }, 400);
+    }
+
+    async function byteProcessor(byte) {
+        if (detected && !flashing) scheduleFirstBlock();
+        switch (byte) {
+            case 0xA5:
+                if (!detected) {
+                    detected = true;
+                    if (!writer) throw new Error("Serial writer is not available.");
+                    await writer.write(initSequence);
+                } else if (flashing) {
+                    throw new Error("Bad response from radio during handshake.");
+                }
+                break;
+            case 0xA3:
+                if (!flashing) {
+                    if (detected) throw new Error("Bad ACK from radio.");
+                    break;
+                }
+                if (block > lastBlock) {
+                    statusDiv.textContent = "Flashing complete.";
+                    stopTransfer();
+                    break;
+                }
+                if (!writer || !firmware) throw new Error("Flash data or serial writer is not available.");
+                statusDiv.textContent = `Flashing block: ${block + 1} / ${lastBlock + 1}`;
+                const packet = new Uint8Array(36);
+                packet[0] = block === lastBlock ? 0xA2 : 0xA1;
+                packet[1] = (block >> 8) & 0xFF;
+                packet[2] = block & 0xFF;
+                packet.set(firmware.subarray(block * 32, block * 32 + 32), 4);
+                let checksum = 0;
+                for (let i = 4; i < 36; i++) checksum = (checksum + packet[i]) & 0xFF;
+                packet[3] = checksum;
+                await writer.write(packet);
+                block++;
+                break;
+            default:
+                if (detected) throw new Error(`Bad data from radio: 0x${byte.toString(16).padStart(2, "0")}`);
+        }
+    }
+
+    async function byteReader() {
+        while (started) {
+            if (!reader) throw new Error("Serial reader is not available.");
+            const { value, done } = await reader.read();
+            if (done || !value) throw new Error("Serial connection lost.");
+            for (const byte of value) await byteProcessor(byte);
+        }
+    }
+
+    nicTool.flasherBusy = () => started;
+    nicTool.closeFlasher = async () => {
+        shuttingDown = true;
+        stopTransfer();
+        await closeSerial();
+        setActiveButtons();
+    };
+})();
+
+/* ==================== Codeplug Manager ==================== */
+(() => {
+    let port = null;
+    let writer = null;
+    let reader = null;
+    let codeplug = null;
+    let started = false;
+    let synced = false;
+    let syncCount = 0;
+    let state = 0;
+    let ack = false;
+    let blkcount = 0;
+    let blkcs = 0;
+    let blkbuffer = new Uint8Array(32);
+    let shuttingDown = false;
+    let readerTask = null;
+
+    const codeplugFileInput = document.getElementById("codeplugFile");
+    const readButton = document.getElementById("readButton");
+    const writeButton = document.getElementById("writeButton");
+    const connectButton = document.getElementById("cpConnectButton");
+    const abortButton = document.getElementById("cpAbortButton");
+    const saveButton = document.getElementById("saveButton");
+    const defaultButton = document.getElementById("defaultButton");
+    const DEFAULT_CODEPLUG_B64 = "";
+
+    function resetProtocolState() {
+        synced = false;
+        syncCount = 0;
+        state = 0;
+        ack = false;
+        blkcount = 0;
+        blkcs = 0;
+        blkbuffer.fill(0);
+    }
+
+    function setActiveButtons() {
+        const connected = port !== null && reader !== null && writer !== null;
+        readButton.disabled = started || !connected;
+        writeButton.disabled = started || !connected || codeplug === null;
+        saveButton.disabled = started || codeplug === null;
+        abortButton.disabled = !connected;
+        connectButton.disabled = connected;
+        codeplugFileInput.disabled = started;
+        defaultButton.disabled = started;
+    }
+
+    const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+    function initPacket(length, fill) {
+        const packet = new Uint8Array(length);
+        packet.fill(fill);
+        return packet;
+    }
+
+    async function closeSerial() {
+        const currentReader = reader;
+        const currentWriter = writer;
+        const currentPort = port;
+        reader = null;
+        writer = null;
+        port = null;
+
+        if (currentReader) {
+            try { await currentReader.cancel(); } catch (error) { console.warn("Reader cancel failed:", error); }
+            try { currentReader.releaseLock(); } catch (error) { console.warn("Reader release failed:", error); }
+        }
+        if (currentWriter) {
+            try { currentWriter.releaseLock(); } catch (error) { console.warn("Writer release failed:", error); }
+        }
+        if (currentPort) {
+            try { await currentPort.close(); } catch (error) { console.warn("Port close failed:", error); }
+        }
+        resetProtocolState();
+    }
+
+    async function syncRadio() {
+        resetProtocolState();
+        if (!writer) return false;
+        await writer.write(initPacket(32, 1));
+        for (let i = 0; i < 100; i++) {
+            if (synced) return true;
+            await sleep(10);
+        }
+        return false;
+    }
+
+    async function byteReader() {
+        while (port !== null && reader !== null) {
+            const { value, done } = await reader.read();
+            if (done || !value) {
+                if (shuttingDown) return;
+                throw new Error("Serial connection lost.");
+            }
+            for (const byte of value) byteProcessor(byte);
+        }
+    }
+
+    function byteProcessor(byte) {
+        switch (state) {
+            case 0:
+                if (byte === 1) {
+                    syncCount++;
+                    if (syncCount > 16) {
+                        if (!synced) statusDiv.textContent = "Radio Found";
+                        synced = true;
+                    }
+                } else if (byte === 0x30) {
+                    state = 0x30;
+                    blkcount = 0;
+                    blkcs = 0;
+                } else if (byte === 0x31) {
+                    ack = true;
+                }
+                break;
+            case 0x30:
+                blkcs = (blkcs + byte) & 0xFF;
+                blkbuffer[blkcount++] = byte;
+                if (blkcount >= 32) state = 0x130;
+                break;
+            case 0x130:
+                ack = blkcs === byte;
+                state = 0;
+                break;
+            default:
+                state = 0;
+        }
+    }
+
+    async function waitForAck() {
+        for (let i = 0; i < 100; i++) {
+            if (ack) return true;
+            if (shuttingDown || !port) return false;
+            await sleep(10);
+        }
+        return false;
+    }
+
+    connectButton.addEventListener("click", async () => {
+        if (!("serial" in navigator)) {
+            statusDiv.textContent = "Web Serial not supported - please use desktop Chrome or Edge.";
+            return;
+        }
+        shuttingDown = false;
+        try {
+            port = await navigator.serial.requestPort();
+            await port.open({ baudRate: 38400 });
+            writer = port.writable.getWriter();
+            reader = port.readable.getReader();
+            statusDiv.textContent = "Connected to serial port.";
+            readerTask = byteReader().catch(async error => {
+                if (!shuttingDown) statusDiv.textContent = `Serial read error: ${errorMessage(error)}`;
+                started = false;
+                await closeSerial();
+                setActiveButtons();
+            });
+        } catch (error) {
+            statusDiv.textContent = error && error.name === "NotFoundError" ? "" : `Serial port error: ${errorMessage(error)}`;
+            await closeSerial();
+        }
+        setActiveButtons();
+    });
+
+    codeplugFileInput.addEventListener("change", async event => {
+        codeplug = null;
+        try {
+            const file = event.target.files[0];
+            if (!file) {
+                statusDiv.textContent = "";
+                setActiveButtons();
+                return;
+            }
+            const fileBytes = new Uint8Array(await file.arrayBuffer());
+            if (fileBytes.length !== 8192) throw new Error(`Incorrect file size ${fileBytes.length}`);
+            codeplug = fileBytes.slice();
+            statusDiv.textContent = "Codeplug file loaded.";
+        } catch (error) {
+            codeplugFileInput.value = "";
+            statusDiv.textContent = `File error: ${errorMessage(error)}`;
+        }
+        setActiveButtons();
+    });
+
+    writeButton.addEventListener("click", async () => {
+        if (!writer || !codeplug) return;
+        started = true;
+        shuttingDown = false;
+        setActiveButtons();
+        try {
+            statusDiv.textContent = "Finding Radio.";
+            if (!await syncRadio()) throw new Error("Cannot Find Radio.");
+            const packet = new Uint8Array(35);
+            packet[0] = 0x31;
+            for (let block = 0; block < 256; block++) {
+                if (shuttingDown) throw new Error("Operation aborted.");
+                packet[1] = block;
+                let checksum = 0;
+                for (let i = 0; i < 32; i++) {
+                    const value = codeplug[block * 32 + i];
+                    packet[i + 2] = value;
+                    checksum = (checksum + value) & 0xFF;
+                }
+                packet[34] = checksum;
+                ack = false;
+                await writer.write(packet);
+                if (!await waitForAck()) throw new Error("Radio Communication Timeout");
+                statusDiv.textContent = `Writing Block ${block + 1}/256`;
+            }
+            await writer.write(new Uint8Array([0x49]));
+            statusDiv.textContent = "Codeplug Write Complete";
+        } catch (error) {
+            if (!shuttingDown) statusDiv.textContent = `Error: ${errorMessage(error)}`;
+        } finally {
+            started = false;
+            setActiveButtons();
+        }
+    });
+
+    readButton.addEventListener("click", async () => {
+        if (!writer) return;
+        started = true;
+        shuttingDown = false;
+        setActiveButtons();
+        try {
+            statusDiv.textContent = "Finding Radio.";
+            if (!await syncRadio()) throw new Error("Cannot Find Radio.");
+            const temp = new Uint8Array(8192);
+            const request = new Uint8Array([0x30, 0]);
+            for (let block = 0; block < 256; block++) {
+                if (shuttingDown) throw new Error("Operation aborted.");
+                request[1] = block;
+                ack = false;
+                await writer.write(request);
+                if (!await waitForAck()) throw new Error("Radio Communication Timeout");
+                temp.set(blkbuffer, block * 32);
+                statusDiv.textContent = `Reading Block ${block + 1}/256`;
+            }
+            codeplug = temp;
+            statusDiv.textContent = "Codeplug Read Complete";
+        } catch (error) {
+            if (!shuttingDown) statusDiv.textContent = `Error: ${errorMessage(error)}`;
+        } finally {
+            started = false;
+            setActiveButtons();
+        }
+    });
+
+    abortButton.addEventListener("click", async () => {
+        shuttingDown = true;
+        started = false;
+        await closeSerial();
+        statusDiv.textContent = "Operation aborted.";
+        setActiveButtons();
+    });
+
+    saveButton.addEventListener("click", () => {
+        if (!codeplug) return;
+        const url = URL.createObjectURL(new Blob([codeplug], { type: "application/octet-stream" }));
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = "codeplug.nfw";
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 0);
+    });
+
+    if (DEFAULT_CODEPLUG_B64.length > 0) {
+        defaultButton.hidden = false;
+        defaultButton.addEventListener("click", () => {
+            try {
+                const binary = atob(DEFAULT_CODEPLUG_B64);
+                const bytes = Uint8Array.from(binary, char => char.charCodeAt(0));
+                if (bytes.length !== 8192) throw new Error(`Wrong size ${bytes.length} (expected 8192)`);
+                codeplug = bytes;
+                statusDiv.textContent = "Default codeplug loaded.";
+            } catch (error) {
+                codeplug = null;
+                statusDiv.textContent = `Default codeplug error: ${errorMessage(error)}`;
+            }
+            setActiveButtons();
+        });
+    }
+
+    nicTool.codeplugBusy = () => started;
+    nicTool.closeCodeplug = async () => {
+        shuttingDown = true;
+        started = false;
+        await closeSerial();
+        if (readerTask) {
+            try { await readerTask; } catch { }
+            readerTask = null;
+        }
+        setActiveButtons();
+    };
+})();
+
+/* ==================== Mode switching ==================== */
+const flasherSection = document.getElementById("flasherSection");
+const codeplugSection = document.getElementById("codeplugSection");
+const modeButton = document.getElementById("modeButton");
+const pageTitle = document.getElementById("pageTitle");
+let currentMode = null;
+let switching = false;
+
+function applyMode(mode) {
+    currentMode = mode;
+    flasherSection.hidden = mode !== "flasher";
+    codeplugSection.hidden = mode !== "codeplug";
+    pageTitle.textContent = mode === "flasher" ? "H3/H8 Firmware Flasher" : "nicFW Codeplug Manager";
+    document.title = pageTitle.textContent;
+    modeButton.textContent = mode === "flasher" ? "Codeplug Manager" : "Firmware Flasher";
+    statusDiv.textContent = "";
+}
+
+modeButton.addEventListener("click", async () => {
+    if (switching) return;
+    const target = currentMode === "flasher" ? "codeplug" : "flasher";
+    const busy = currentMode === "flasher" ? nicTool.flasherBusy() : nicTool.codeplugBusy();
+    if (busy && !confirm("A transfer is still running.\nAbort it and switch?")) return;
+    switching = true;
+    modeButton.disabled = true;
+    try {
+        if (currentMode === "flasher") await nicTool.closeFlasher();
+        else await nicTool.closeCodeplug();
+        applyMode(target);
+        history.replaceState(null, "", `#${target}`);
+    } catch (error) {
+        statusDiv.textContent = `Mode switch failed: ${errorMessage(error)}`;
+    } finally {
+        switching = false;
+        modeButton.disabled = false;
+    }
+});
+
+applyMode(location.hash === "#codeplug" ? "codeplug" : "flasher");
+</script>
+</body>
+</html>
